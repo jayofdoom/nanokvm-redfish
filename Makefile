@@ -19,6 +19,10 @@ run:
 test:
 	$(GO) test ./...
 
+.PHONY: test-coverage
+test-coverage:
+	$(GO) test -cover ./...
+
 .PHONY: fmt
 fmt:
 	$(GO) fmt ./...

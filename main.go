@@ -52,9 +52,14 @@ var HWPcie = Hardware{
 }
 
 var currentHardware *Hardware
+var hwVersionFile = "/etc/kvm/hw"
 
 func detectHardware() (*Hardware, error) {
-	content, err := os.ReadFile("/etc/kvm/hw")
+	return detectHardwareFromFile(hwVersionFile)
+}
+
+func detectHardwareFromFile(path string) (*Hardware, error) {
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read hardware version: %w", err)
 	}
