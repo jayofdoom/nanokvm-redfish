@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type HWVersion string
@@ -54,6 +55,18 @@ var HWPcie = Hardware{
 var currentHardware *Hardware
 var hwVersionFile = "/etc/kvm/hw"
 
+// Boot configuration (in-memory stub)
+var currentBootConfig = Boot{
+	BootSourceOverrideEnabled: "Disabled",
+	BootSourceOverrideMode:    "UEFI",
+	BootSourceOverrideTarget:  "None",
+	BootSourceOverrideTargetAllowableValues: []string{
+		"None", "Pxe", "Cd", "Usb", "Hdd", "BiosSetup",
+		"Utilities", "Diags", "UefiShell", "UefiTarget",
+		"SDCard", "UefiHttp", "RemoteDrive", "UefiBootNext",
+	},
+}
+
 func detectHardware() (*Hardware, error) {
 	return detectHardwareFromFile(hwVersionFile)
 }
@@ -95,13 +108,23 @@ func readGPIO(path string) (int, error) {
 	return value, nil
 }
 
-func writeGPIO(path string, value int) error {
+func writeGPIO(path string, duration int) error {
 	if path == "" {
 		return fmt.Errorf("GPIO path not available for this hardware")
 	}
 
-	data := []byte(fmt.Sprintf("%d", value))
-	return os.WriteFile(path, data, 0644)
+	if err := os.WriteFile(path, []byte("1"), 0o666); err != nil {
+		return fmt.Errorf("failed to write GPIO: %w", err)
+	}
+
+	if duration > 0 {
+		time.Sleep(time.Duration(duration) * time.Millisecond)
+	}
+
+	if err := os.WriteFile(path, []byte("0"), 0o666); err != nil {
+		return fmt.Errorf("failed to write GPIO: %w", err)
+	}
+	return nil
 }
 
 func getPowerState() (string, error) {
@@ -110,24 +133,23 @@ func getPowerState() (string, error) {
 		return "", err
 	}
 
-	if powerLED == 1 {
+	// GPIO value is inverted: 0 = power on, 1 = power off
+	if powerLED == 0 {
 		return "On", nil
 	}
 	return "Off", nil
 }
 
 func performReset() error {
-	if err := writeGPIO(currentHardware.GPIOReset, 0); err != nil {
-		return err
-	}
-	return writeGPIO(currentHardware.GPIOReset, 1)
+	return writeGPIO(currentHardware.GPIOReset, 800)
 }
 
 func pressPowerButton() error {
-	if err := writeGPIO(currentHardware.GPIOPower, 0); err != nil {
-		return err
-	}
-	return writeGPIO(currentHardware.GPIOPower, 1)
+	return writeGPIO(currentHardware.GPIOPower, 800)
+}
+
+func longPressPowerButton() error {
+	return writeGPIO(currentHardware.GPIOPower, 1000)
 }
 
 type ServiceRoot struct {
@@ -137,6 +159,8 @@ type ServiceRoot struct {
 	Name         string                 `json:"Name"`
 	RedfishVersion string              `json:"RedfishVersion"`
 	Systems      map[string]string      `json:"Systems"`
+	Managers     map[string]string      `json:"Managers"`
+	Chassis      map[string]string      `json:"Chassis"`
 }
 
 type SystemCollection struct {
@@ -146,12 +170,20 @@ type SystemCollection struct {
 	Members   []map[string]string    `json:"Members"`
 }
 
+type Boot struct {
+	BootSourceOverrideEnabled            string   `json:"BootSourceOverrideEnabled"`
+	BootSourceOverrideMode               string   `json:"BootSourceOverrideMode,omitempty"`
+	BootSourceOverrideTarget             string   `json:"BootSourceOverrideTarget"`
+	BootSourceOverrideTargetAllowableValues []string `json:"BootSourceOverrideTarget@Redfish.AllowableValues"`
+}
+
 type ComputerSystem struct {
 	ODataType    string                 `json:"@odata.type"`
 	ODataID      string                 `json:"@odata.id"`
 	ID           string                 `json:"Id"`
 	Name         string                 `json:"Name"`
 	PowerState   string                 `json:"PowerState"`
+	Boot         Boot                   `json:"Boot"`
 	Actions      map[string]interface{} `json:"Actions"`
 }
 
@@ -162,6 +194,10 @@ type ResetAction struct {
 
 type ResetRequest struct {
 	ResetType string `json:"ResetType"`
+}
+
+type SystemPatchRequest struct {
+	Boot *Boot `json:"Boot,omitempty"`
 }
 
 func handleServiceRoot(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +214,12 @@ func handleServiceRoot(w http.ResponseWriter, r *http.Request) {
 		RedfishVersion: "1.8.0",
 		Systems: map[string]string{
 			"@odata.id": "/redfish/v1/Systems",
+		},
+		Managers: map[string]string{
+			"@odata.id": "/redfish/v1/Managers",
+		},
+		Chassis: map[string]string{
+			"@odata.id": "/redfish/v1/Chassis",
 		},
 	}
 
@@ -205,11 +247,17 @@ func handleSystems(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleSystem(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		handleSystemGet(w, r)
+	case http.MethodPatch:
+		handleSystemPatch(w, r)
+	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
+}
 
+func handleSystemGet(w http.ResponseWriter, r *http.Request) {
 	powerState, err := getPowerState()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to get power state: %v", err), http.StatusInternalServerError)
@@ -222,6 +270,7 @@ func handleSystem(w http.ResponseWriter, r *http.Request) {
 		ID:         "System.1",
 		Name:       "NanoKVM System",
 		PowerState: powerState,
+		Boot:       currentBootConfig,
 		Actions: map[string]interface{}{
 			"#ComputerSystem.Reset": ResetAction{
 				Target: "/redfish/v1/Systems/System.1/Actions/ComputerSystem.Reset",
@@ -232,6 +281,48 @@ func handleSystem(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(system)
+}
+
+func handleSystemPatch(w http.ResponseWriter, r *http.Request) {
+	var req SystemPatchRequest
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Update boot configuration if provided
+	if req.Boot != nil {
+		if req.Boot.BootSourceOverrideEnabled != "" {
+			currentBootConfig.BootSourceOverrideEnabled = req.Boot.BootSourceOverrideEnabled
+		}
+		if req.Boot.BootSourceOverrideTarget != "" {
+			// Validate target is in allowed values
+			validTarget := false
+			for _, allowed := range currentBootConfig.BootSourceOverrideTargetAllowableValues {
+				if req.Boot.BootSourceOverrideTarget == allowed {
+					validTarget = true
+					break
+				}
+			}
+			if !validTarget {
+				http.Error(w, "Invalid BootSourceOverrideTarget", http.StatusBadRequest)
+				return
+			}
+			currentBootConfig.BootSourceOverrideTarget = req.Boot.BootSourceOverrideTarget
+		}
+		if req.Boot.BootSourceOverrideMode != "" {
+			currentBootConfig.BootSourceOverrideMode = req.Boot.BootSourceOverrideMode
+		}
+	}
+
+	// Return success with no content
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func handleReset(w http.ResponseWriter, r *http.Request) {
@@ -264,7 +355,7 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 	case "ForceOff":
 		powerState, _ := getPowerState()
 		if powerState == "On" {
-			if err := pressPowerButton(); err != nil {
+			if err := longPressPowerButton(); err != nil {
 				http.Error(w, fmt.Sprintf("Failed to power off: %v", err), http.StatusInternalServerError)
 				return
 			}
@@ -290,6 +381,88 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func handleManagers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	collection := SystemCollection{
+		ODataType: "#ManagerCollection.ManagerCollection",
+		ODataID:   "/redfish/v1/Managers",
+		Name:      "Manager Collection",
+		Members: []map[string]string{
+			{"@odata.id": "/redfish/v1/Managers/BMC"},
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(collection)
+}
+
+func handleManager(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	manager := map[string]interface{}{
+		"@odata.type": "#Manager.v1_5_0.Manager",
+		"@odata.id":   "/redfish/v1/Managers/BMC",
+		"Id":          "BMC",
+		"Name":        "NanoKVM Manager",
+		"ManagerType": "BMC",
+		"Status": map[string]string{
+			"State":  "Enabled",
+			"Health": "OK",
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(manager)
+}
+
+func handleChassis(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	collection := SystemCollection{
+		ODataType: "#ChassisCollection.ChassisCollection",
+		ODataID:   "/redfish/v1/Chassis",
+		Name:      "Chassis Collection",
+		Members: []map[string]string{
+			{"@odata.id": "/redfish/v1/Chassis/System"},
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(collection)
+}
+
+func handleChassisItem(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	chassis := map[string]interface{}{
+		"@odata.type": "#Chassis.v1_10_0.Chassis",
+		"@odata.id":   "/redfish/v1/Chassis/System",
+		"Id":          "System",
+		"Name":        "NanoKVM System Chassis",
+		"ChassisType": "RackMount",
+		"Status": map[string]string{
+			"State":  "Enabled",
+			"Health": "OK",
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(chassis)
+}
+
 func main() {
 	hw, err := detectHardware()
 	if err != nil {
@@ -305,6 +478,14 @@ func main() {
 	http.HandleFunc("/redfish/v1/Systems/System.1", handleSystem)
 	http.HandleFunc("/redfish/v1/Systems/System.1/", handleSystem)
 	http.HandleFunc("/redfish/v1/Systems/System.1/Actions/ComputerSystem.Reset", handleReset)
+	http.HandleFunc("/redfish/v1/Managers", handleManagers)
+	http.HandleFunc("/redfish/v1/Managers/", handleManagers)
+	http.HandleFunc("/redfish/v1/Managers/BMC", handleManager)
+	http.HandleFunc("/redfish/v1/Managers/BMC/", handleManager)
+	http.HandleFunc("/redfish/v1/Chassis", handleChassis)
+	http.HandleFunc("/redfish/v1/Chassis/", handleChassis)
+	http.HandleFunc("/redfish/v1/Chassis/System", handleChassisItem)
+	http.HandleFunc("/redfish/v1/Chassis/System/", handleChassisItem)
 
 	port := ":8080"
 	log.Printf("Starting Redfish API server on %s", port)

@@ -139,16 +139,16 @@ func TestReadGPIO(t *testing.T) {
 func TestWriteGPIO(t *testing.T) {
 	tests := []struct {
 		name        string
-		value       int
+		duration    int
 		expectError bool
 	}{
 		{
-			name:  "Write 0",
-			value: 0,
+			name:     "No duration",
+			duration: 0,
 		},
 		{
-			name:  "Write 1",
-			value: 1,
+			name:     "With duration",
+			duration: 100,
 		},
 	}
 
@@ -161,7 +161,7 @@ func TestWriteGPIO(t *testing.T) {
 			tmpFile.Close()
 			defer os.Remove(tmpFile.Name())
 
-			err = writeGPIO(tmpFile.Name(), tt.value)
+			err = writeGPIO(tmpFile.Name(), tt.duration)
 			if tt.expectError {
 				if err == nil {
 					t.Error("Expected error but got none")
@@ -171,19 +171,20 @@ func TestWriteGPIO(t *testing.T) {
 					t.Errorf("Unexpected error: %v", err)
 				}
 
+				// After writeGPIO, the file should contain "0" (final state)
 				content, err := os.ReadFile(tmpFile.Name())
 				if err != nil {
 					t.Fatal(err)
 				}
-				if string(content) != string(rune(tt.value+'0')) {
-					t.Errorf("Expected %d, got %s", tt.value, content)
+				if string(content) != "0" {
+					t.Errorf("Expected final GPIO state '0', got %s", content)
 				}
 			}
 		})
 	}
 
 	t.Run("Empty path", func(t *testing.T) {
-		err := writeGPIO("", 1)
+		err := writeGPIO("", 0)
 		if err == nil {
 			t.Error("Expected error for empty path")
 		}
@@ -246,7 +247,7 @@ func TestHandleSystem(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	gpioFile := filepath.Join(tmpDir, "gpio_power_led")
-	if err := os.WriteFile(gpioFile, []byte("1"), 0644); err != nil {
+	if err := os.WriteFile(gpioFile, []byte("0"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	
@@ -277,6 +278,14 @@ func TestHandleSystem(t *testing.T) {
 	if system.PowerState != "On" {
 		t.Errorf("Expected PowerState 'On', got '%s'", system.PowerState)
 	}
+
+	// Test Boot properties
+	if system.Boot.BootSourceOverrideEnabled == "" {
+		t.Error("Boot.BootSourceOverrideEnabled should not be empty")
+	}
+	if len(system.Boot.BootSourceOverrideTargetAllowableValues) == 0 {
+		t.Error("Boot.BootSourceOverrideTargetAllowableValues should not be empty")
+	}
 }
 
 func TestHandleReset(t *testing.T) {
@@ -293,7 +302,7 @@ func TestHandleReset(t *testing.T) {
 	if err := os.WriteFile(gpioReset, []byte("1"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(gpioPowerLED, []byte("1"), 0644); err != nil {
+	if err := os.WriteFile(gpioPowerLED, []byte("0"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -406,5 +415,128 @@ func TestInvalidJSON(t *testing.T) {
 
 	if status := rr.Code; status != http.StatusBadRequest {
 		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, status)
+	}
+}
+
+func TestHandleSystemPatch(t *testing.T) {
+	// Reset boot config to default
+	currentBootConfig = Boot{
+		BootSourceOverrideEnabled: "Disabled",
+		BootSourceOverrideMode:    "UEFI",
+		BootSourceOverrideTarget:  "None",
+		BootSourceOverrideTargetAllowableValues: []string{
+			"None", "Pxe", "Cd", "Usb", "Hdd", "BiosSetup",
+			"Utilities", "Diags", "UefiShell", "UefiTarget",
+			"SDCard", "UefiHttp", "RemoteDrive", "UefiBootNext",
+		},
+	}
+
+	tests := []struct {
+		name       string
+		body       string
+		expectCode int
+	}{
+		{
+			name: "Valid boot config update",
+			body: `{
+				"Boot": {
+					"BootSourceOverrideEnabled": "Once",
+					"BootSourceOverrideTarget": "Pxe"
+				}
+			}`,
+			expectCode: http.StatusNoContent,
+		},
+		{
+			name: "Invalid boot target",
+			body: `{
+				"Boot": {
+					"BootSourceOverrideTarget": "InvalidTarget"
+				}
+			}`,
+			expectCode: http.StatusBadRequest,
+		},
+		{
+			name:       "Invalid JSON",
+			body:       "invalid json",
+			expectCode: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest("PATCH", "/redfish/v1/Systems/System.1", 
+				bytes.NewBufferString(tt.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			rr := httptest.NewRecorder()
+			handler := http.HandlerFunc(handleSystem)
+			handler.ServeHTTP(rr, req)
+
+			if status := rr.Code; status != tt.expectCode {
+				t.Errorf("Expected status %d, got %d", tt.expectCode, status)
+			}
+
+			// Verify boot config was updated for valid request
+			if tt.name == "Valid boot config update" && tt.expectCode == http.StatusNoContent {
+				if currentBootConfig.BootSourceOverrideEnabled != "Once" {
+					t.Errorf("Expected BootSourceOverrideEnabled 'Once', got '%s'", 
+						currentBootConfig.BootSourceOverrideEnabled)
+				}
+				if currentBootConfig.BootSourceOverrideTarget != "Pxe" {
+					t.Errorf("Expected BootSourceOverrideTarget 'Pxe', got '%s'", 
+						currentBootConfig.BootSourceOverrideTarget)
+				}
+			}
+		})
+	}
+}
+
+func TestHandleManagers(t *testing.T) {
+	req, err := http.NewRequest("GET", "/redfish/v1/Managers", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	handler := http.HandlerFunc(handleManagers)
+	handler.ServeHTTP(rr, req)
+
+	if status := rr.Code; status != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, status)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result["@odata.type"] != "#ManagerCollection.ManagerCollection" {
+		t.Errorf("Expected ManagerCollection type, got %v", result["@odata.type"])
+	}
+}
+
+func TestHandleChassis(t *testing.T) {
+	req, err := http.NewRequest("GET", "/redfish/v1/Chassis", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	handler := http.HandlerFunc(handleChassis)
+	handler.ServeHTTP(rr, req)
+
+	if status := rr.Code; status != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, status)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result["@odata.type"] != "#ChassisCollection.ChassisCollection" {
+		t.Errorf("Expected ChassisCollection type, got %v", result["@odata.type"])
 	}
 }
